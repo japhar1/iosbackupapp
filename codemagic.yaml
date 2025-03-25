@@ -1,0 +1,29 @@
+workflows:
+  ios-backup-app:
+    name: iOS Backup App Workflow
+    max_build_duration: 60
+    environment:
+      vars:
+        XCODE_WORKSPACE: "BackupApp.xcworkspace"
+        XCODE_SCHEME: "BackupApp"
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+      ios_signing:
+        distribution_type: ad_hoc
+        bundle_identifier: "com.yourcompany.backupapp"
+    scripts:
+      - name: Install dependencies
+        script: |
+          gem install cocoapods
+          pod install
+      - name: Build iOS app
+        script: |
+          xcode-project use-xcframeworks
+          xcode-project build-ipa --workspace "$XCODE_WORKSPACE" --scheme "$XCODE_SCHEME"
+    artifacts:
+      - build/ios/ipa/*.ipa
+    publishing:
+      email:
+        recipients:
+          - "your-email@example.com"
