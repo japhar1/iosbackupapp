@@ -1,0 +1,212 @@
+import SwiftUI
+import Photos
+import Contacts
+import GoogleSignIn
+import GoogleAPIClientForREST
+
+struct ContentView: View {
+    @State private var backupInProgress = false
+    @State private var restoreInProgress = false
+    @State private var progress: Double = 0.0
+    @State private var statusMessage = ""
+    
+    let driveService = GTLRDriveService()
+    
+    var body: some View {
+        VStack(spacing: 20) {
+            Button(action: {
+                signInToGoogle()
+            }) {
+                Text("Sign in to Google Drive")
+            }
+            .padding()
+            .background(Color.gray)
+            .foregroundColor(.white)
+            .cornerRadius(10)
+            
+            Button(action: {
+                backupInProgress = true
+                backupPhotos()
+            }) {
+                Text(backupInProgress ? "Backing up..." : "Backup Photos")
+            }
+            .padding()
+            .background(Color.blue)
+            .foregroundColor(.white)
+            .cornerRadius(10)
+            .disabled(backupInProgress)
+            
+            Button(action: {
+                backupInProgress = true
+                backupContacts()
+            }) {
+                Text(backupInProgress ? "Backing up..." : "Backup Contacts")
+            }
+            .padding()
+            .background(Color.green)
+            .foregroundColor(.white)
+            .cornerRadius(10)
+            .disabled(backupInProgress)
+            
+            Button(action: {
+                restoreInProgress = true
+                restorePhotos()
+            }) {
+                Text(restoreInProgress ? "Restoring..." : "Restore Photos")
+            }
+            .padding()
+            .background(Color.orange)
+            .foregroundColor(.white)
+            .cornerRadius(10)
+            .disabled(restoreInProgress)
+            
+            Button(action: {
+                restoreInProgress = true
+                restoreContacts()
+            }) {
+                Text(restoreInProgress ? "Restoring..." : "Restore Contacts")
+            }
+            .padding()
+            .background(Color.red)
+            .foregroundColor(.white)
+            .cornerRadius(10)
+            .disabled(restoreInProgress)
+            
+            ProgressView(value: progress, total: 1.0)
+                .padding()
+                .opacity(backupInProgress || restoreInProgress ? 1 : 0)
+            
+            Text(statusMessage)
+                .foregroundColor(.gray)
+        }
+        .padding()
+    }
+    
+    func signInToGoogle() {
+        guard let clientID = Bundle.main.object(forInfoDictionaryKey: "GOOGLE_CLIENT_ID") as? String else { return }
+        let config = GIDConfiguration(clientID: clientID)
+        GIDSignIn.sharedInstance.configuration = config
+        
+        guard let rootViewController = UIApplication.shared.connectedScenes
+            .compactMap({ ($0 as? UIWindowScene)?.keyWindow?.rootViewController })
+            .first else { return }
+        
+        GIDSignIn.sharedInstance.signIn(withPresenting: rootViewController) { user, error in
+            if let error = error {
+                statusMessage = "Sign-in failed: \(error.localizedDescription)"
+            } else {
+                driveService.authorizer = user?.authentication.fetcherAuthorizer()
+                statusMessage = "Signed in to Google Drive"
+            }
+        }
+    }
+    
+    func backupPhotos() {
+        DispatchQueue.global(qos: .background).async {
+            let fetchOptions = PHFetchOptions()
+            let assets = PHAsset.fetchAssets(with: .image, options: fetchOptions)
+            let total = Double(assets.count)
+            var completed = 0.0
+            
+            assets.enumerateObjects { asset, _, _ in
+                let options = PHImageRequestOptions()
+                options.isSynchronous = false
+                
+                PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
+                    if let imageData = data {
+                        uploadToGoogleDrive(data: imageData, fileName: "photo_\(asset.localIdentifier).jpg")
+                        DispatchQueue.main.async {
+                            completed += 1
+                            progress = completed / total
+                            if completed == total {
+                                backupInProgress = false
+                                statusMessage = "Photo backup completed."
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    func backupContacts() {
+        DispatchQueue.global(qos: .background).async {
+            let store = CNContactStore()
+            let request = CNContactFetchRequest(keysToFetch: [CNContactVCardSerialization.descriptorForRequiredKeys()])
+            var contacts = [CNContact]()
+            
+            do {
+                try store.enumerateContacts(with: request) { contact, _ in
+                    contacts.append(contact)
+                }
+                let vcfData = try CNContactVCardSerialization.data(with: contacts)
+                uploadToGoogleDrive(data: vcfData, fileName: "contacts_backup.vcf")
+                DispatchQueue.main.async {
+                    backupInProgress = false
+                    statusMessage = "Contact backup completed."
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    backupInProgress = false
+                    statusMessage = "Failed to backup contacts."
+                }
+            }
+        }
+    }
+    
+    func restorePhotos() {
+        let query = GTLRDriveQuery_FilesList.query()
+        query.q = "name contains 'photo_'"
+        driveService.executeQuery(query) { _, result, error in
+            if let error = error {
+                statusMessage = "Restore failed: \(error.localizedDescription)"
+                restoreInProgress = false
+                return
+            }
+            
+            guard let files = (result as? GTLRDrive_FileList)?.files else { return }
+            for file in files {
+                guard let fileId = file.identifier else { continue }
+                let downloadQuery = GTLRDriveQuery_FilesGet.queryForMedia(withFileId: fileId)
+                driveService.executeQuery(downloadQuery) { _, fileData, error in
+                    if let data = fileData as? Data, let image = UIImage(data: data) {
+                        UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
+                    }
+                }
+            }
+            restoreInProgress = false
+            statusMessage = "Photo restore completed."
+        }
+    }
+    
+    func restoreContacts() {
+        let query = GTLRDriveQuery_FilesList.query()
+        query.q = "name = 'contacts_backup.vcf'"
+        driveService.executeQuery(query) { _, result, error in
+            if let files = (result as? GTLRDrive_FileList)?.files, let file = files.first {
+                let downloadQuery = GTLRDriveQuery_FilesGet.queryForMedia(withFileId: file.identifier!)
+                driveService.executeQuery(downloadQuery) { _, fileData, _ in
+                    if let vcfData = fileData as? Data, let contacts = try? CNContactVCardSerialization.contacts(with: vcfData) {
+                        let store = CNContactStore()
+                        let saveRequest = CNSaveRequest()
+                        for contact in contacts {
+                            saveRequest.add(contact.mutableCopy() as! CNMutableContact, toContainerWithIdentifier: nil)
+                        }
+                        try? store.execute(saveRequest)
+                    }
+                }
+            }
+            restoreInProgress = false
+            statusMessage = "Contacts restored successfully."
+        }
+    }
+}
+
+@main
+struct BackupApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+    }
+}
